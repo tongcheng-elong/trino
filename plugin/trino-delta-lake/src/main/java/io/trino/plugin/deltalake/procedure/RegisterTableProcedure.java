@@ -37,6 +37,7 @@ import javax.inject.Provider;
 
 import java.io.IOException;
 import java.lang.invoke.MethodHandle;
+import java.util.Optional;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static io.trino.plugin.base.util.Procedures.checkProcedureArgument;
@@ -156,8 +157,8 @@ public class RegisterTableProcedure
         Table table = buildTable(session, schemaTableName, tableLocation, true);
 
         PrincipalPrivileges principalPrivileges = buildInitialPrivilegeSet(table.getOwner().orElseThrow());
-        statisticsAccess.invalidateCache(tableLocation);
-        transactionLogAccess.invalidateCaches(tableLocation);
+        statisticsAccess.invalidateCache(schemaTableName, Optional.of(tableLocation));
+        transactionLogAccess.invalidateCache(schemaTableName, Optional.of(tableLocation));
         // Verify we're registering a location with a valid table
         try {
             TableSnapshot tableSnapshot = transactionLogAccess.loadSnapshot(table.getSchemaTableName(), tableLocation, session);
