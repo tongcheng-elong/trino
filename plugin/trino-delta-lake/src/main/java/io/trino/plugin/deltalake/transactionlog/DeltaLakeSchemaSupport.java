@@ -69,6 +69,7 @@ import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
 import static io.trino.spi.type.SmallintType.SMALLINT;
+import static io.trino.spi.type.TimestampType.TIMESTAMP_MICROS;
 import static io.trino.spi.type.TimestampWithTimeZoneType.createTimestampWithTimeZoneType;
 import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
@@ -85,9 +86,10 @@ public final class DeltaLakeSchemaSupport
     public static final String COLUMN_MAPPING_MODE_CONFIGURATION_KEY = "delta.columnMapping.mode";
 
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#valid-feature-names-in-table-features
-    // TODO: Add support for 'deletionVectors' and 'timestampNTZ' reader features
+    // TODO: Add support for 'deletionVectors' reader features
     private static final Set<String> SUPPORTED_READER_FEATURES = ImmutableSet.<String>builder()
             .add("columnMapping")
+            .add("timestampNtz")
             .build();
 
     public enum ColumnMappingMode
@@ -515,6 +517,9 @@ public final class DeltaLakeSchemaSupport
                 return VARBINARY;
             case "date":
                 return DATE;
+            case "timestamp_ntz":
+                // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#timestamp-without-timezone-timestampntz
+                return TIMESTAMP_MICROS;
             case "timestamp":
                 // Spark/DeltaLake stores timestamps in UTC, but renders them in session time zone.
                 // For more info, see https://delta-users.slack.com/archives/GKTUWT03T/p1585760533005400
