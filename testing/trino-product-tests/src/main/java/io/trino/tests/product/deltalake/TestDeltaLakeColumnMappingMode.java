@@ -722,14 +722,62 @@ public class TestDeltaLakeColumnMappingMode
                 " 'delta.minWriterVersion'='5')");
 
         try {
-            assertQueryFailure(() -> onTrino().executeQuery("ALTER TABLE delta.default." + tableName + " EXECUTE OPTIMIZE"))
-                    .hasMessageContaining("Executing 'optimize' procedure with column mapping %s is not supported".formatted(mode));
             assertQueryFailure(() -> onTrino().executeQuery("ALTER TABLE delta.default." + tableName + " ADD COLUMN new_col varchar"))
                     .hasMessageContaining("Adding a column with column mapping %s is not supported".formatted(mode));
             assertQueryFailure(() -> onTrino().executeQuery("ALTER TABLE delta.default." + tableName + " RENAME COLUMN a_number TO renamed_column"))
                     .hasMessageContaining("This connector does not support renaming columns");
             assertQueryFailure(() -> onTrino().executeQuery("ALTER TABLE delta.default." + tableName + " DROP COLUMN a_number"))
                     .hasMessageContaining("This connector does not support dropping columns");
+        }
+        finally {
+            dropDeltaTableWithRetry("default." + tableName);
+        }
+    }
+
+    @Test(groups = {DELTA_LAKE_DATABRICKS, DELTA_LAKE_OSS, DELTA_LAKE_EXCLUDE_73, DELTA_LAKE_EXCLUDE_91, PROFILE_SPECIFIC_TESTS}, dataProvider = "columnMappingDataProvider")
+    @Flaky(issue = DATABRICKS_COMMUNICATION_FAILURE_ISSUE, match = DATABRICKS_COMMUNICATION_FAILURE_MATCH)
+    public void testOptimizeProcedureColumnMappingMode(String mode)
+    {
+        String tableName = "test_dl_optimize_column_mapping_mode_" + randomNameSuffix();
+
+        onDelta().executeQuery("" +
+                "CREATE TABLE default." + tableName +
+                "(a_number INT, a_struct STRUCT<x: INT>) " +
+                "USING delta " +
+                "LOCATION 's3://" + bucketName + "/databricks-compatibility-test-" + tableName + "'" +
+                "TBLPROPERTIES ('delta.columnMapping.mode'='" + mode + "')");
+
+        try {
+            onTrino().executeQuery("INSERT INTO delta.default." + tableName + " VALUES (1, row(11))");
+            onTrino().executeQuery("INSERT INTO delta.default." + tableName + " VALUES (2, row(22))");
+            onTrino().executeQuery("INSERT INTO delta.default." + tableName + " VALUES (3, row(33))");
+
+            List<Row> expectedStats = ImmutableList.<Row>builder()
+                    .add(row("a_number", null, 3.0, 0.0, null, "1", "3"))
+                    .add(row("a_struct", null, null, null, null, null, null))
+                    .add(row(null, null, null, null, 3.0, null, null))
+                    .build();
+            assertThat(onTrino().executeQuery("SHOW STATS FOR delta.default." + tableName))
+                    .containsOnly(expectedStats);
+
+            // Execute OPTIMIZE procedure and verify that the statistics is preserved and the table is still writable and readable
+            onTrino().executeQuery("ALTER TABLE delta.default." + tableName + " EXECUTE OPTIMIZE");
+
+            assertThat(onTrino().executeQuery("SHOW STATS FOR delta.default." + tableName))
+                    .containsOnly(expectedStats);
+
+            onTrino().executeQuery("INSERT INTO delta.default." + tableName + " VALUES (4, row(44))");
+            onDelta().executeQuery("INSERT INTO default." + tableName + " VALUES (5, named_struct('x',55))");
+
+            List<Row> expectedRows = ImmutableList.<Row>builder()
+                    .add(row(1, 11))
+                    .add(row(2, 22))
+                    .add(row(3, 33))
+                    .add(row(4, 44))
+                    .add(row(5, 55))
+                    .build();
+            assertThat(onTrino().executeQuery("SELECT a_number, a_struct.x FROM delta.default." + tableName)).contains(expectedRows);
+            assertThat(onDelta().executeQuery("SELECT a_number, a_struct.x FROM default." + tableName)).contains(expectedRows);
         }
         finally {
             dropDeltaTableWithRetry("default." + tableName);

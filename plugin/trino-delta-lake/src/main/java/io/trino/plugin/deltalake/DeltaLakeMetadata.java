@@ -1738,11 +1738,6 @@ public class DeltaLakeMetadata
 
         checkWriteAllowed(session, table);
         checkSupportedWriterVersion(session, table);
-        ColumnMappingMode columnMappingMode = getColumnMappingMode(table.getMetadataEntry());
-        if (columnMappingMode != NONE) {
-            // TODO https://github.com/trinodb/trino/issues/12638 Support 'optimize' table procedure for id and name column mapping mode
-            throw new TrinoException(NOT_SUPPORTED, "Executing 'optimize' procedure with column mapping %s is not supported".formatted(columnMappingMode.name().toLowerCase(ENGLISH)));
-        }
 
         return new BeginTableExecuteResult<>(
                 executeHandle.withProcedureHandle(optimizeHandle.withCurrentVersion(table.getReadVersion())),
