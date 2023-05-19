@@ -47,6 +47,7 @@ import io.trino.plugin.deltalake.statistics.ExtendedStatistics;
 import io.trino.plugin.deltalake.transactionlog.AddFileEntry;
 import io.trino.plugin.deltalake.transactionlog.CdcEntry;
 import io.trino.plugin.deltalake.transactionlog.CommitInfoEntry;
+import io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport;
 import io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.ColumnMappingMode;
 import io.trino.plugin.deltalake.transactionlog.DeltaLakeTransactionLogEntry;
 import io.trino.plugin.deltalake.transactionlog.MetadataEntry;
@@ -151,6 +152,7 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -189,6 +191,7 @@ import static io.trino.plugin.deltalake.DeltaLakeSessionProperties.isProjectionP
 import static io.trino.plugin.deltalake.DeltaLakeSessionProperties.isTableStatisticsEnabled;
 import static io.trino.plugin.deltalake.DeltaLakeTableProperties.CHANGE_DATA_FEED_ENABLED_PROPERTY;
 import static io.trino.plugin.deltalake.DeltaLakeTableProperties.CHECKPOINT_INTERVAL_PROPERTY;
+import static io.trino.plugin.deltalake.DeltaLakeTableProperties.COLUMN_MAPPING_MODE_PROPERTY;
 import static io.trino.plugin.deltalake.DeltaLakeTableProperties.LOCATION_PROPERTY;
 import static io.trino.plugin.deltalake.DeltaLakeTableProperties.PARTITIONED_BY_PROPERTY;
 import static io.trino.plugin.deltalake.DeltaLakeTableProperties.getChangeDataFeedEnabled;
@@ -199,20 +202,25 @@ import static io.trino.plugin.deltalake.metastore.HiveMetastoreBackedDeltaLakeMe
 import static io.trino.plugin.deltalake.metastore.HiveMetastoreBackedDeltaLakeMetastore.TABLE_PROVIDER_VALUE;
 import static io.trino.plugin.deltalake.procedure.DeltaLakeTableProcedureId.OPTIMIZE;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.APPEND_ONLY_CONFIGURATION_KEY;
+import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.COLUMN_MAPPING_PHYSICAL_NAME_CONFIGURATION_KEY;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.ColumnMappingMode.ID;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.ColumnMappingMode.NAME;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.ColumnMappingMode.NONE;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.changeDataFeedEnabled;
+import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.deserializeType;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.extractPartitionColumns;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.extractSchema;
+import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.generateColumnMetadata;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.getCheckConstraints;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.getColumnComments;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.getColumnInvariants;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.getColumnMappingMode;
+import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.getColumnTypes;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.getColumnsMetadata;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.getColumnsNullability;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.getGeneratedColumnExpressions;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.isAppendOnly;
+import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.serializeColumnType;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.serializeSchemaAsJson;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.serializeStatsAsJson;
 import static io.trino.plugin.deltalake.transactionlog.DeltaLakeSchemaSupport.unsupportedReaderFeatures;
@@ -302,6 +310,8 @@ public class DeltaLakeMetadata
     private static final int MAX_READER_VERSION = 3;
     private static final int MAX_WRITER_VERSION = 5;
     private static final int CDF_SUPPORTED_WRITER_VERSION = 4;
+    private static final int COLUMN_MAPPING_MODE_SUPPORTED_READER_VERSION = 2;
+    private static final int COLUMN_MAPPING_MODE_SUPPORTED_WRITER_VERSION = 5;
 
     // Matches the dummy column Databricks stores in the metastore
     private static final List<Column> DUMMY_DATA_COLUMNS = ImmutableList.of(
@@ -536,6 +546,11 @@ public class DeltaLakeMetadata
 
         Optional<Boolean> changeDataFeedEnabled = metadataEntry.isChangeDataFeedEnabled();
         changeDataFeedEnabled.ifPresent(value -> properties.put(CHANGE_DATA_FEED_ENABLED_PROPERTY, value));
+
+        ColumnMappingMode columnMappingMode = DeltaLakeSchemaSupport.getColumnMappingMode(metadataEntry);
+        if (columnMappingMode != NONE) {
+            properties.put(COLUMN_MAPPING_MODE_PROPERTY, columnMappingMode);
+        }
 
         return new ConnectorTableMetadata(
                 tableHandle.getSchemaTableName(),
@@ -784,6 +799,12 @@ public class DeltaLakeMetadata
         Location deltaLogDirectory = Location.of(getTransactionLogDir(location));
         Optional<Long> checkpointInterval = getCheckpointInterval(tableMetadata.getProperties());
         Optional<Boolean> changeDataFeedEnabled = getChangeDataFeedEnabled(tableMetadata.getProperties());
+        ColumnMappingMode columnMappingMode = DeltaLakeTableProperties.getColumnMappingMode(tableMetadata.getProperties());
+        if (changeDataFeedEnabled.orElse(false) && columnMappingMode != NONE) {
+            // TODO https://github.com/trinodb/trino/issues/16967 Add support for CDF with column mapping mode
+            throw new TrinoException(NOT_SUPPORTED, "Creating tables with %s and %s is unsupported".formatted(CHANGE_DATA_FEED_ENABLED_PROPERTY, COLUMN_MAPPING_MODE_PROPERTY));
+        }
+        AtomicInteger fieldId = new AtomicInteger();
 
         try {
             TrinoFileSystem fileSystem = fileSystemFactory.create(session);
@@ -791,27 +812,36 @@ public class DeltaLakeMetadata
                 validateTableColumns(tableMetadata);
 
                 List<String> partitionColumns = getPartitionedBy(tableMetadata.getProperties());
-                List<DeltaLakeColumnHandle> deltaLakeColumns = tableMetadata.getColumns()
-                        .stream()
-                        .map(column -> toColumnHandle(column, column.getName(), column.getType(), partitionColumns))
-                        .collect(toImmutableList());
+                ImmutableList.Builder<String> columnNames = ImmutableList.builderWithExpectedSize(tableMetadata.getColumns().size());
+                ImmutableMap.Builder<String, Object> columnTypes = ImmutableMap.builderWithExpectedSize(tableMetadata.getColumns().size());
+                ImmutableMap.Builder<String, Map<String, Object>> columnsMetadata = ImmutableMap.builderWithExpectedSize(tableMetadata.getColumns().size());
+                for (ColumnMetadata column : tableMetadata.getColumns()) {
+                    columnNames.add(column.getName());
+                    columnTypes.put(column.getName(), serializeColumnType(columnMappingMode, fieldId, column.getType()));
+                    columnsMetadata.put(column.getName(), generateColumnMetadata(columnMappingMode, fieldId));
+                }
                 Map<String, String> columnComments = tableMetadata.getColumns().stream()
                         .filter(column -> column.getComment() != null)
                         .collect(toImmutableMap(ColumnMetadata::getName, ColumnMetadata::getComment));
                 Map<String, Boolean> columnsNullability = tableMetadata.getColumns().stream()
                         .collect(toImmutableMap(ColumnMetadata::getName, ColumnMetadata::isNullable));
-                TransactionLogWriter transactionLogWriter = transactionLogWriterFactory.newWriterWithoutTransactionIsolation(session, location);
+                OptionalInt maxFieldId = OptionalInt.empty();
+                if (columnMappingMode == ID || columnMappingMode == NAME) {
+                    maxFieldId = OptionalInt.of(fieldId.get());
+                }
 
+                TransactionLogWriter transactionLogWriter = transactionLogWriterFactory.newWriterWithoutTransactionIsolation(session, location);
                 appendTableEntries(
                         0,
                         transactionLogWriter,
                         randomUUID().toString(),
-                        deltaLakeColumns,
+                        columnNames.build(),
                         partitionColumns,
+                        columnTypes.buildOrThrow(),
                         columnComments,
                         columnsNullability,
-                        deltaLakeColumns.stream().collect(toImmutableMap(DeltaLakeColumnHandle::getColumnName, ignored -> ImmutableMap.of())),
-                        configurationForNewTable(checkpointInterval, changeDataFeedEnabled),
+                        columnsMetadata.buildOrThrow(),
+                        configurationForNewTable(checkpointInterval, changeDataFeedEnabled, columnMappingMode, maxFieldId),
                         CREATE_TABLE_OPERATION,
                         session,
                         tableMetadata.getComment(),
@@ -913,19 +943,77 @@ public class DeltaLakeMetadata
             external = false;
         }
 
+        Optional<Boolean> changeDataFeedEnabled = getChangeDataFeedEnabled(tableMetadata.getProperties());
+        ColumnMappingMode columnMappingMode = DeltaLakeTableProperties.getColumnMappingMode(tableMetadata.getProperties());
+        if (changeDataFeedEnabled.orElse(false) && columnMappingMode != NONE) {
+            // TODO https://github.com/trinodb/trino/issues/16967 Add support for CDF with column mapping mode
+            throw new TrinoException(NOT_SUPPORTED, "Creating tables with %s and %s is unsupported".formatted(CHANGE_DATA_FEED_ENABLED_PROPERTY, COLUMN_MAPPING_MODE_PROPERTY));
+        }
+        AtomicInteger fieldId = new AtomicInteger();
+
         Location finalLocation = Location.of(location);
         checkPathContainsNoFiles(session, finalLocation);
         setRollback(() -> deleteRecursivelyIfExists(fileSystemFactory.create(session), finalLocation));
 
+        boolean usePhysicalName = columnMappingMode == ID || columnMappingMode == NAME;
+        int columnSize = tableMetadata.getColumns().size();
+        ImmutableList.Builder<String> columnNames = ImmutableList.builderWithExpectedSize(columnSize);
+        ImmutableMap.Builder<String, Object> columnTypes = ImmutableMap.builderWithExpectedSize(columnSize);
+        ImmutableMap.Builder<String, Boolean> columnNullabilities = ImmutableMap.builderWithExpectedSize(columnSize);
+        ImmutableMap.Builder<String, Map<String, Object>> columnsMetadata = ImmutableMap.builderWithExpectedSize(columnSize);
+        ImmutableList.Builder<DeltaLakeColumnHandle> columnHandles = ImmutableList.builderWithExpectedSize(columnSize);
+        for (ColumnMetadata column : tableMetadata.getColumns()) {
+            columnNames.add(column.getName());
+            columnNullabilities.put(column.getName(), column.isNullable());
+
+            Object serializedType = serializeColumnType(columnMappingMode, fieldId, column.getType());
+            Type type = deserializeType(typeManager, serializedType, usePhysicalName);
+            columnTypes.put(column.getName(), serializedType);
+
+            OptionalInt id;
+            String physicalName;
+            Map<String, Object> columnMetadata;
+            switch (columnMappingMode) {
+                case NONE -> {
+                    id = OptionalInt.empty();
+                    physicalName = column.getName();
+                    columnMetadata = ImmutableMap.of();
+                }
+                case ID, NAME -> {
+                    columnMetadata = generateColumnMetadata(columnMappingMode, fieldId);
+                    id = OptionalInt.of(fieldId.get());
+                    physicalName = (String) columnMetadata.get(COLUMN_MAPPING_PHYSICAL_NAME_CONFIGURATION_KEY);
+                }
+                default -> throw new IllegalArgumentException("Unexpected column mapping mode: " + columnMappingMode);
+            }
+            columnHandles.add(toColumnHandle(column, id, physicalName, type, partitionedBy));
+            columnsMetadata.put(column.getName(), columnMetadata);
+        }
+
+        String schemaString = serializeSchemaAsJson(
+                columnNames.build(),
+                columnTypes.buildOrThrow(),
+                ImmutableMap.of(),
+                columnNullabilities.buildOrThrow(),
+                columnsMetadata.buildOrThrow());
+
+        OptionalInt maxFieldId = OptionalInt.empty();
+        if (columnMappingMode == ID || columnMappingMode == NAME) {
+            maxFieldId = OptionalInt.of(fieldId.get());
+        }
+
         return new DeltaLakeOutputTableHandle(
                 schemaName,
                 tableName,
-                tableMetadata.getColumns().stream().map(column -> toColumnHandle(column, column.getName(), column.getType(), partitionedBy)).collect(toImmutableList()),
+                columnHandles.build(),
                 location,
                 getCheckpointInterval(tableMetadata.getProperties()),
                 external,
                 tableMetadata.getComment(),
-                getChangeDataFeedEnabled(tableMetadata.getProperties()),
+                changeDataFeedEnabled,
+                schemaString,
+                columnMappingMode,
+                maxFieldId,
                 protocolEntryForNewTable(tableMetadata.getProperties()));
     }
 
@@ -1022,6 +1110,8 @@ public class DeltaLakeMetadata
                 "Table '%s' does not have correct query id set",
                 table);
 
+        ColumnMappingMode columnMappingMode = handle.getColumnMappingMode();
+        String schemaString = handle.getSchemaString();
         try {
             // For CTAS there is no risk of multiple writers racing. Using writer without transaction isolation so we are not limiting support for CTAS to
             // filesystems for which we have proper implementations of TransactionLogSynchronizers.
@@ -1031,12 +1121,9 @@ public class DeltaLakeMetadata
                     0,
                     transactionLogWriter,
                     randomUUID().toString(),
-                    handle.getInputColumns(),
+                    schemaString,
                     handle.getPartitionedBy(),
-                    ImmutableMap.of(),
-                    handle.getInputColumns().stream().collect(toImmutableMap(DeltaLakeColumnHandle::getColumnName, ignored -> true)),
-                    handle.getInputColumns().stream().collect(toImmutableMap(DeltaLakeColumnHandle::getColumnName, ignored -> ImmutableMap.of())),
-                    configurationForNewTable(handle.getCheckpointInterval(), handle.getChangeDataFeedEnabled()),
+                    configurationForNewTable(handle.getCheckpointInterval(), handle.getChangeDataFeedEnabled(), columnMappingMode, handle.getMaxColumnId()),
                     CREATE_TABLE_AS_OPERATION,
                     session,
                     handle.getComment(),
@@ -1049,6 +1136,9 @@ public class DeltaLakeMetadata
                         .map(DataFileInfo::getCreationTime)
                         .max(Long::compare)
                         .map(Instant::ofEpochMilli);
+                Map<String, String> physicalColumnMapping = DeltaLakeSchemaSupport.getColumnMetadata(schemaString, typeManager, columnMappingMode).stream()
+                        .map(e -> Map.entry(e.getName(), e.getPhysicalName()))
+                        .collect(toImmutableMap(Entry::getKey, Entry::getValue));
 
                 updateTableStatistics(
                         session,
@@ -1056,7 +1146,7 @@ public class DeltaLakeMetadata
                         location,
                         maxFileModificationTime,
                         computedStatistics,
-                        Optional.empty()); // TODO: Pass physical column names mapping when supporting table creation with column mapping mode
+                        Optional.of(physicalColumnMapping));
             }
 
             PrincipalPrivileges principalPrivileges = buildInitialPrivilegeSet(table.getOwner().orElseThrow());
@@ -1157,10 +1247,16 @@ public class DeltaLakeMetadata
             long commitVersion = deltaLakeTableHandle.getReadVersion() + 1;
 
             List<String> partitionColumns = getPartitionedBy(tableMetadata.getProperties());
-            List<DeltaLakeColumnHandle> columns = tableMetadata.getColumns().stream()
-                    .filter(columnMetadata -> !columnMetadata.isHidden())
-                    .map(columnMetadata -> toColumnHandle(columnMetadata, columnMetadata.getName(), columnMetadata.getType(), partitionColumns))
-                    .collect(toImmutableList());
+
+            ImmutableList.Builder<String> columnNames = ImmutableList.builderWithExpectedSize(tableMetadata.getColumns().size());
+            ImmutableMap.Builder<String, Object> columnTypes = ImmutableMap.builderWithExpectedSize(tableMetadata.getColumns().size());
+            for (ColumnMetadata columnMetadata : tableMetadata.getColumns()) {
+                if (columnMetadata.isHidden()) {
+                    continue;
+                }
+                columnNames.add(columnMetadata.getName());
+                columnTypes.put(columnMetadata.getName(), serializeColumnType(columnMappingMode, new AtomicInteger(), columnMetadata.getType()));
+            }
 
             ImmutableMap.Builder<String, String> columnComments = ImmutableMap.builder();
             columnComments.putAll(getColumnComments(deltaLakeTableHandle.getMetadataEntry()).entrySet().stream()
@@ -1173,8 +1269,9 @@ public class DeltaLakeMetadata
                     commitVersion,
                     transactionLogWriter,
                     deltaLakeTableHandle.getMetadataEntry().getId(),
-                    columns,
+                    columnNames.build(),
                     partitionColumns,
+                    columnTypes.buildOrThrow(),
                     columnComments.buildOrThrow(),
                     getColumnsNullability(deltaLakeTableHandle.getMetadataEntry()),
                     getColumnsMetadata(deltaLakeTableHandle.getMetadataEntry()),
@@ -1219,13 +1316,18 @@ public class DeltaLakeMetadata
         try {
             long commitVersion = handle.getReadVersion() + 1;
 
+            ImmutableMap.Builder<String, Map<String, Object>> columnMetadata = ImmutableMap.builder();
+            columnMetadata.putAll(getColumnsMetadata(handle.getMetadataEntry()));
+            Map<String, String> configuration = new HashMap<>(handle.getMetadataEntry().getConfiguration());
+            columnMetadata.put(newColumnMetadata.getName(), ImmutableMap.of());
+
             List<String> partitionColumns = getPartitionedBy(tableMetadata.getProperties());
-            ImmutableList.Builder<DeltaLakeColumnHandle> columnsBuilder = ImmutableList.builder();
+            ImmutableList.Builder<String> columnsBuilder = ImmutableList.builder();
             columnsBuilder.addAll(tableMetadata.getColumns().stream()
                     .filter(column -> !column.isHidden())
-                    .map(column -> toColumnHandle(column, column.getName(), column.getType(), partitionColumns))
+                    .map(ColumnMetadata::getName)
                     .collect(toImmutableList()));
-            columnsBuilder.add(toColumnHandle(newColumnMetadata, newColumnMetadata.getName(), newColumnMetadata.getType(), partitionColumns));
+            columnsBuilder.add(newColumnMetadata.getName());
             ImmutableMap.Builder<String, String> columnComments = ImmutableMap.builder();
             columnComments.putAll(getColumnComments(handle.getMetadataEntry()));
             if (newColumnMetadata.getComment() != null) {
@@ -1234,22 +1336,26 @@ public class DeltaLakeMetadata
             ImmutableMap.Builder<String, Boolean> columnsNullability = ImmutableMap.builder();
             columnsNullability.putAll(getColumnsNullability(handle.getMetadataEntry()));
             columnsNullability.put(newColumnMetadata.getName(), newColumnMetadata.isNullable());
+            Map<String, Object> columnTypes = ImmutableMap.<String, Object>builderWithExpectedSize(tableMetadata.getColumns().size() + 1)
+                    .putAll(getColumnTypes(handle.getMetadataEntry()))
+                    .put(Map.entry(newColumnMetadata.getName(), serializeColumnType(columnMappingMode, new AtomicInteger(), newColumnMetadata.getType())))
+                    .buildOrThrow();
 
-            ImmutableMap.Builder<String, Map<String, Object>> columnMetadata = ImmutableMap.builder();
-            columnMetadata.putAll(getColumnsMetadata(handle.getMetadataEntry()));
-            columnMetadata.put(newColumnMetadata.getName(), ImmutableMap.of());
+            String schemaJson = serializeSchemaAsJson(
+                    columnsBuilder.build(),
+                    columnTypes,
+                    columnComments.buildOrThrow(),
+                    columnsNullability.buildOrThrow(),
+                    columnMetadata.buildOrThrow());
 
             TransactionLogWriter transactionLogWriter = transactionLogWriterFactory.newWriter(session, handle.getLocation());
             appendTableEntries(
                     commitVersion,
                     transactionLogWriter,
                     handle.getMetadataEntry().getId(),
-                    columnsBuilder.build(),
+                    schemaJson,
                     partitionColumns,
-                    columnComments.buildOrThrow(),
-                    columnsNullability.buildOrThrow(),
-                    columnMetadata.buildOrThrow(),
-                    handle.getMetadataEntry().getConfiguration(),
+                    configuration,
                     ADD_COLUMN_OPERATION,
                     session,
                     Optional.ofNullable(handle.getMetadataEntry().getDescription()),
@@ -1265,8 +1371,9 @@ public class DeltaLakeMetadata
             long commitVersion,
             TransactionLogWriter transactionLogWriter,
             String tableId,
-            List<DeltaLakeColumnHandle> columns,
+            List<String> columnNames,
             List<String> partitionColumnNames,
+            Map<String, Object> columnTypes,
             Map<String, String> columnComments,
             Map<String, Boolean> columnNullability,
             Map<String, Map<String, Object>> columnMetadata,
@@ -1280,7 +1387,7 @@ public class DeltaLakeMetadata
                 commitVersion,
                 transactionLogWriter,
                 tableId,
-                serializeSchemaAsJson(columns, columnComments, columnNullability, columnMetadata),
+                serializeSchemaAsJson(columnNames, columnTypes, columnComments, columnNullability, columnMetadata),
                 partitionColumnNames,
                 configuration,
                 operation,
@@ -1896,13 +2003,19 @@ public class DeltaLakeMetadata
 
     private ProtocolEntry protocolEntryForNewTable(Map<String, Object> properties)
     {
+        int readerVersion = DEFAULT_READER_VERSION;
         int writerVersion = DEFAULT_WRITER_VERSION;
         Optional<Boolean> changeDataFeedEnabled = getChangeDataFeedEnabled(properties);
         if (changeDataFeedEnabled.isPresent() && changeDataFeedEnabled.get()) {
             // Enabling cdf (change data feed) requires setting the writer version to 4
             writerVersion = CDF_SUPPORTED_WRITER_VERSION;
         }
-        return new ProtocolEntry(DEFAULT_READER_VERSION, writerVersion, Optional.empty(), Optional.empty());
+        ColumnMappingMode columnMappingMode = DeltaLakeTableProperties.getColumnMappingMode(properties);
+        if (columnMappingMode == ID || columnMappingMode == NAME) {
+            readerVersion = COLUMN_MAPPING_MODE_SUPPORTED_READER_VERSION;
+            writerVersion = COLUMN_MAPPING_MODE_SUPPORTED_WRITER_VERSION;
+        }
+        return new ProtocolEntry(readerVersion, writerVersion, Optional.empty(), Optional.empty());
     }
 
     private void writeCheckpointIfNeeded(ConnectorSession session, SchemaTableName table, String tableLocation, Optional<Long> checkpointInterval, long newVersion)
@@ -3069,11 +3182,6 @@ public class DeltaLakeMetadata
             return Domain.all(type);
         }
         return Domain.notNull(type);
-    }
-
-    private static DeltaLakeColumnHandle toColumnHandle(ColumnMetadata column, String physicalName, Type physicalType, Collection<String> partitionColumns)
-    {
-        return toColumnHandle(column, OptionalInt.empty(), physicalName, physicalType, partitionColumns);
     }
 
     private static DeltaLakeColumnHandle toColumnHandle(ColumnMetadata column, OptionalInt fieldId, String physicalName, Type physicalType, Collection<String> partitionColumns)
