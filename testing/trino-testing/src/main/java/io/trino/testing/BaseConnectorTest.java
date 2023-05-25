@@ -3729,6 +3729,10 @@ public abstract class BaseConnectorTest
             assertUpdate("COMMENT ON COLUMN " + view.getName() + "." + viewColumnName + " IS 'new region key comment'");
             assertThat(getColumnComment(view.getName(), viewColumnName)).isEqualTo("new region key comment");
 
+            // comment deleted
+            assertUpdate("COMMENT ON COLUMN " + view.getName() + "." + viewColumnName + " IS NULL");
+            assertThat(getColumnComment(view.getName(), viewColumnName)).isEqualTo(null);
+
             // comment updated
             assertUpdate("COMMENT ON COLUMN " + view.getName() + "." + viewColumnName + " IS 'updated region key comment'");
             assertThat(getColumnComment(view.getName(), viewColumnName)).isEqualTo("updated region key comment");
@@ -3736,10 +3740,6 @@ public abstract class BaseConnectorTest
             // comment set to empty
             assertUpdate("COMMENT ON COLUMN " + view.getName() + "." + viewColumnName + " IS ''");
             assertThat(getColumnComment(view.getName(), viewColumnName)).isEqualTo("");
-
-            // comment deleted
-            assertUpdate("COMMENT ON COLUMN " + view.getName() + "." + viewColumnName + " IS NULL");
-            assertThat(getColumnComment(view.getName(), viewColumnName)).isEqualTo(null);
         }
     }
 
