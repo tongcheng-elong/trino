@@ -23,8 +23,6 @@ import io.trino.hive.thrift.metastore.AllocateTableWriteIdsResponse;
 import io.trino.hive.thrift.metastore.AlterPartitionsRequest;
 import io.trino.hive.thrift.metastore.AlterTableRequest;
 import io.trino.hive.thrift.metastore.CheckLockRequest;
-import io.trino.hive.thrift.metastore.ClientCapabilities;
-import io.trino.hive.thrift.metastore.ClientCapability;
 import io.trino.hive.thrift.metastore.ColumnStatistics;
 import io.trino.hive.thrift.metastore.ColumnStatisticsDesc;
 import io.trino.hive.thrift.metastore.ColumnStatisticsObj;
@@ -36,7 +34,6 @@ import io.trino.hive.thrift.metastore.GetPrincipalsInRoleRequest;
 import io.trino.hive.thrift.metastore.GetPrincipalsInRoleResponse;
 import io.trino.hive.thrift.metastore.GetRoleGrantsForPrincipalRequest;
 import io.trino.hive.thrift.metastore.GetRoleGrantsForPrincipalResponse;
-import io.trino.hive.thrift.metastore.GetTableRequest;
 import io.trino.hive.thrift.metastore.GetValidWriteIdsRequest;
 import io.trino.hive.thrift.metastore.GrantRevokePrivilegeRequest;
 import io.trino.hive.thrift.metastore.GrantRevokeRoleRequest;
@@ -309,15 +306,7 @@ public class ThriftHiveMetastoreClient
     public Table getTable(String databaseName, String tableName)
             throws TException
     {
-        return alternativeCall(
-                ThriftHiveMetastoreClient::defaultIsValidExceptionalResponse,
-                chosenGetTableAlternative,
-                () -> {
-                    GetTableRequest request = new GetTableRequest(databaseName, tableName);
-                    request.setCapabilities(new ClientCapabilities(ImmutableList.of(ClientCapability.INSERT_ONLY_TABLES)));
-                    return client.getTableReq(request).getTable();
-                },
-                () -> client.getTable(databaseName, tableName));
+        return client.getTable(databaseName, tableName);
     }
 
     @Override
